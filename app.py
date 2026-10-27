@@ -1,17 +1,9 @@
+from pathlib import Path
+import joblib, sklearn
 import numpy as np, pandas as pd, streamlit as st
 import matplotlib.pyplot as plt, seaborn as sns
 from scipy import stats
 from scipy.stats import chi2_contingency, norm, binom
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LinearRegression, Ridge, Lasso, LogisticRegression
-from sklearn.tree import DecisionTreeRegressor, DecisionTreeClassifier
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.svm import SVC
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, accuracy_score, f1_score, confusion_matrix
 
 st.set_page_config(page_title="Book Prices & Ratings", page_icon="📚", layout="wide")
 sns.set_theme(style="whitegrid")
@@ -90,56 +82,55 @@ with tabs[3]:
     st.write(f"Chi-square price band × rating: χ²={chi:.2f}, dof={dof} → {verdict(pch)}"); st.dataframe(tab)
     r_, pr_ = stats.pearsonr(p, df.rating); st.write(f"Pearson r (price, rating) = {r_:.3f}, p={pr_:.4f}")
 
-NUM, CAT = ["rating", "title_length", "title_words"], ["category"]
+MODEL_FILE = Path(__file__).parent / "book_models.pkl"
 
 @st.cache_resource
-def train_regression(d):
-    X, y = d[NUM + CAT], d["price"]; Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=42)
-    pre = ColumnTransformer([("n", StandardScaler(), NUM), ("c", OneHotEncoder(handle_unknown="ignore"), CAT)])
-    ms = {"Multiple Linear": LinearRegression(), "Ridge": Ridge(1.0), "Lasso": Lasso(0.01, max_iter=10000),
-          "Decision Tree": DecisionTreeRegressor(max_depth=5, random_state=42),
-          "Random Forest": RandomForestRegressor(200, max_depth=8, random_state=42)}
-    fit, rows = {}, []
-    for k, m in ms.items():
-        pl = Pipeline([("pre", pre), ("m", m)]).fit(Xtr, ytr); pr = pl.predict(Xte); fit[k] = pl
-        rows.append([k, mean_absolute_error(yte, pr), np.sqrt(mean_squared_error(yte, pr)), r2_score(yte, pr)])
-    res = pd.DataFrame(rows, columns=["Model", "MAE", "RMSE", "R2"]).sort_values("RMSE").round(3)
-    return fit, res, np.sqrt(mean_squared_error(yte, np.full(len(yte), ytr.mean())))
+def load_models(path=str(MODEL_FILE)):
+    """Load the models trained in the notebook (exported with joblib.dump)."""
+    if not Path(path).exists():
+        return None
+    return joblib.load(path)
 
-CN = ["price", "title_length", "title_words"]
+bundle = load_models()
+if bundle is None:
+    st.sidebar.error("book_models.pkl not found. Run the last cell of the notebook and put the file next to app.py.")
+else:
+    if bundle.get("sklearn_version") != sklearn.__version__:
+        st.sidebar.warning(f"Models were trained with scikit-learn {bundle.get('sklearn_version')}, "
+                           f"but this app runs {sklearn.__version__}. If predictions fail, align the versions in requirements.txt.")
+    reg, reg_res, reg_base = bundle["reg_models"], bundle["reg_results"], bundle["reg_baseline"]
+    clf, clf_res, clf_base, clf_cm = bundle["clf_models"], bundle["clf_results"], bundle["clf_baseline"], bundle["clf_confusion"]
 
-@st.cache_resource
-def train_classifier(d):
-    X, y = d[CN + CAT], d["high_rating"]; Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-    pre = ColumnTransformer([("n", StandardScaler(), CN), ("c", OneHotEncoder(handle_unknown="ignore"), CAT)])
-    ms = {"Logistic Regression": LogisticRegression(max_iter=1000), "KNN": KNeighborsClassifier(5), "SVM": SVC(),
-          "Decision Tree": DecisionTreeClassifier(max_depth=5, random_state=42), "Random Forest": RandomForestClassifier(200, random_state=42)}
-    fit, rows = {}, []
-    for k, m in ms.items():
-        pl = Pipeline([("pre", pre), ("m", m)]).fit(Xtr, ytr); pr = pl.predict(Xte); fit[k] = (pl, confusion_matrix(yte, pr))
-        rows.append([k, accuracy_score(yte, pr), f1_score(yte, pr)])
-    return fit, pd.DataFrame(rows, columns=["Model", "Accuracy", "F1"]).sort_values("Accuracy", ascending=False).round(3), max(yte.mean(), 1 - yte.mean())
-
-reg, reg_res, reg_base = train_regression(df); clf, clf_res, clf_base = train_classifier(df)
+MISSING = "Model file `book_models.pkl` is missing. Run the last cell of the notebook and place the file next to app.py."
 
 with tabs[4]:
-    st.write("Predicting **price** from rating, title length, title words and category (80/20 split).")
-    st.dataframe(reg_res, width="stretch"); st.caption(f"Baseline RMSE (predict the mean): {reg_base:.3f}. A model that barely beats it has little predictive power.")
-    sl = stats.linregress(df.title_length, p); st.write(f"Simple regression price ~ title_length: slope={sl.slope:.4f}, R²={sl.rvalue**2:.4f}, p={sl.pvalue:.4f}")
+    if bundle is None:
+        st.warning(MISSING)
+    else:
+        st.write("Predicting **price** from rating, title length, title words and category (80/20 split). Models were trained in the notebook.")
+        st.dataframe(reg_res, width="stretch"); st.caption(f"Baseline RMSE (predict the mean): {reg_base:.3f}. A model that barely beats it has little predictive power.")
+        sl = stats.linregress(df.title_length, p); st.write(f"Simple regression price ~ title_length: slope={sl.slope:.4f}, R²={sl.rvalue**2:.4f}, p={sl.pvalue:.4f}")
 
 with tabs[5]:
-    st.write("Predicting whether a book is **highly rated (≥ 4 stars)**.")
-    st.dataframe(clf_res, width="stretch"); st.caption(f"Majority-class baseline accuracy: {clf_base:.3f}")
-    pick = st.selectbox("Confusion matrix for", list(clf))
-    fig, ax = plt.subplots(figsize=(3.5, 3)); sns.heatmap(clf[pick][1], annot=True, fmt="d", cmap="Blues", ax=ax); ax.set_xlabel("Predicted"); ax.set_ylabel("Actual"); st.pyplot(fig)
+    if bundle is None:
+        st.warning(MISSING)
+    else:
+        st.write("Predicting whether a book is **highly rated (≥ 4 stars)**.")
+        st.dataframe(clf_res, width="stretch"); st.caption(f"Majority-class baseline accuracy: {clf_base:.3f}")
+        pick = st.selectbox("Confusion matrix for", list(clf))
+        fig, ax = plt.subplots(figsize=(3.5, 3)); sns.heatmap(clf_cm[pick], annot=True, fmt="d", cmap="Blues", ax=ax); ax.set_xlabel("Predicted"); ax.set_ylabel("Actual"); st.pyplot(fig)
 
 with tabs[6]:
-    st.subheader("Try the models")
-    c1, c2 = st.columns(2)
-    cat = c1.selectbox("Category", sorted(df.category.unique())); tl = c1.slider("Title length (characters)", 5, 150, 35)
-    tw = c1.slider("Title words", 1, 25, 6); rt = c2.slider("Rating", 1, 5, 3); pr_ = c2.slider("Price (£) for the classifier", 10.0, 60.0, 35.0)
-    mname = c2.selectbox("Regression model", list(reg_res.Model))
-    if st.button("Predict"):
-        price = reg[mname].predict(pd.DataFrame([{"rating": rt, "title_length": tl, "title_words": tw, "category": cat}]))[0]
-        pc = clf[clf_res.iloc[0].Model][0]; prob = pc.predict(pd.DataFrame([{"price": pr_, "title_length": tl, "title_words": tw, "category": cat}]))
-        st.success(f"Predicted price: £{price:.2f}"); st.info(f"{clf_res.iloc[0].Model} says: {'highly rated' if prob[0] == 1 else 'not highly rated'}")
+    if bundle is None:
+        st.warning(MISSING)
+    else:
+        st.subheader("Try the models")
+        c1, c2 = st.columns(2)
+        cat = c1.selectbox("Category", sorted(df.category.unique())); tl = c1.slider("Title length (characters)", 5, 150, 35)
+        tw = c1.slider("Title words", 1, 25, 6); rt = c2.slider("Rating", 1, 5, 3); pr_ = c2.slider("Price (£) for the classifier", 10.0, 60.0, 35.0)
+        mname = c2.selectbox("Regression model", list(reg_res.Model))
+        best_clf = clf_res.iloc[0].Model
+        if st.button("Predict"):
+            price = reg[mname].predict(pd.DataFrame([{"rating": rt, "title_length": tl, "title_words": tw, "category": cat}]))[0]
+            prob = clf[best_clf].predict(pd.DataFrame([{"price": pr_, "title_length": tl, "title_words": tw, "category": cat}]))
+            st.success(f"Predicted price: £{price:.2f}"); st.info(f"{best_clf} says: {'highly rated' if prob[0] == 1 else 'not highly rated'}")
